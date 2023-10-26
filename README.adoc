@@ -112,7 +112,7 @@ objdump -d -M intel shellcode.o
 
 == Запустим программу в отладчике
 
-[source]
+[listing]
 ----
 gdb -q vuln
 (gdb) b func
@@ -128,7 +128,7 @@ gdb -q vuln
 
 Попробуйте запустить программу с другим по длине аргументом и получите другой адрес.
 
-[source]
+[listing]
 ----
 (gdb) r A
 (gdb) p $ebp - 0x6c
@@ -181,7 +181,7 @@ gcc injection_input.c
 
 сИ видим, что запустился `sh`.
 
-[source]
+[listing]
 ----
 Welcome 1Ph//shh/binPS
                       L
