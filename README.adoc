@@ -90,7 +90,7 @@ int     0x80        ;Make the system call
 
 [source, shell]
 ----
-nasm -f elf shellcode.asm
+nasm -f elf shellcode.nasm
 ----
 
 == Посмотрим на байты инъекции
